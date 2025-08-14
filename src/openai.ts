@@ -162,7 +162,7 @@ export class impl implements provider.Provider {
                         type: 'tool_use',
                         id: toolCall.id,
                         name: toolCall.function.name,
-                        input: JSON.parse(toolCall.function.arguments)
+                        input: utils.safeJsonParse(toolCall.function.arguments)
                     })
                 }
                 claudeResponse.stop_reason = 'tool_use'
@@ -213,7 +213,7 @@ export class impl implements provider.Provider {
                             ...utils.processToolUsePart(
                                 {
                                     name: toolCall.function.name,
-                                    args: JSON.parse(toolCall.function.arguments)
+                                    args: utils.safeJsonParse(toolCall.function.arguments)
                                 },
                                 currentToolIndex
                             )

@@ -179,6 +179,24 @@ export async function processProviderStream(
     })
 }
 
+export function safeJsonParse(jsonStr: string): any {
+    if (!jsonStr || typeof jsonStr !== 'string') {
+        return {}
+    }
+
+    try {
+        return JSON.parse(jsonStr)
+    } catch (error) {
+        try {
+            const fixedJsonStr = jsonStr.replace(/'/g, '"')
+            return JSON.parse(fixedJsonStr)
+        } catch (secondError) {
+            console.warn('Failed to parse JSON arguments:', jsonStr, secondError)
+            return {}
+        }
+    }
+}
+
 export function cleanJsonSchema(schema: any): any {
     if (!schema || typeof schema !== 'object') {
         return schema
