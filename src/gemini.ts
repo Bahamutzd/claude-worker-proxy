@@ -3,6 +3,7 @@ import * as provider from './provider'
 import * as utils from './utils'
 
 export class impl implements provider.Provider {
+    private tokenEstimator = new utils.OptimizedTokenEstimator()
     async convertToProviderRequest(request: Request, baseUrl: string, apiKey: string): Promise<Request> {
         const claudeRequest = (await request.json()) as types.ClaudeRequest
         const geminiRequest = this.convertToGeminiRequestBody(claudeRequest)
@@ -21,7 +22,10 @@ export class impl implements provider.Provider {
         })
     }
 
-    async convertToClaudeResponse(geminiResponse: Response): Promise<Response> {
+    async convertToClaudeResponse(
+        geminiResponse: Response,
+        originalClaudeRequest?: types.ClaudeRequest
+    ): Promise<Response> {
         if (!geminiResponse.ok) {
             return geminiResponse
         }
@@ -30,9 +34,9 @@ export class impl implements provider.Provider {
         const isStream = contentType.includes('text/event-stream')
 
         if (isStream) {
-            return this.convertStreamResponse(geminiResponse)
+            return this.convertStreamResponse(geminiResponse, originalClaudeRequest)
         } else {
-            return this.convertNormalResponse(geminiResponse)
+            return this.convertNormalResponse(geminiResponse, originalClaudeRequest)
         }
     }
 
@@ -147,7 +151,10 @@ export class impl implements provider.Provider {
         return contents
     }
 
-    private async convertNormalResponse(geminiResponse: Response): Promise<Response> {
+    private async convertNormalResponse(
+        geminiResponse: Response,
+        originalClaudeRequest?: types.ClaudeRequest
+    ): Promise<Response> {
         const geminiData = (await geminiResponse.json()) as types.GeminiResponse
 
         const claudeResponse: types.ClaudeResponse = {
@@ -192,6 +199,12 @@ export class impl implements provider.Provider {
                 input_tokens: geminiData.usageMetadata.promptTokenCount,
                 output_tokens: geminiData.usageMetadata.candidatesTokenCount
             }
+        } else if (originalClaudeRequest) {
+            // Fallback到token估算
+            claudeResponse.usage = {
+                input_tokens: this.tokenEstimator.estimateMessages(originalClaudeRequest.messages),
+                output_tokens: this.tokenEstimator.estimateClaudeContent(claudeResponse.content)
+            }
         }
 
         return new Response(JSON.stringify(claudeResponse), {
@@ -202,35 +215,55 @@ export class impl implements provider.Provider {
         })
     }
 
-    private async convertStreamResponse(geminiResponse: Response): Promise<Response> {
-        return utils.processProviderStream(geminiResponse, (jsonStr, textBlockIndex, toolUseBlockIndex) => {
-            const geminiData = JSON.parse(jsonStr) as types.GeminiResponse
-            if (!geminiData.candidates || geminiData.candidates.length === 0) {
-                return null
-            }
+    private async convertStreamResponse(
+        geminiResponse: Response,
+        originalClaudeRequest?: types.ClaudeRequest
+    ): Promise<Response> {
+        let accumulatedOutputTokens = 0
 
-            const candidate = geminiData.candidates[0]
-            const events: string[] = []
-            let currentTextIndex = textBlockIndex
-            let currentToolIndex = toolUseBlockIndex
+        return utils.processProviderStream(
+            geminiResponse,
+            (jsonStr, textBlockIndex, toolUseBlockIndex) => {
+                const geminiData = JSON.parse(jsonStr) as types.GeminiResponse
+                if (!geminiData.candidates || geminiData.candidates.length === 0) {
+                    return null
+                }
 
-            if (candidate.content) {
-                for (const part of candidate.content.parts) {
-                    if ('text' in part && part.text) {
-                        events.push(...utils.processTextPart(part.text, currentTextIndex))
-                        currentTextIndex++
-                    } else if ('functionCall' in part) {
-                        events.push(...utils.processToolUsePart(part.functionCall, currentToolIndex))
-                        currentToolIndex++
+                const candidate = geminiData.candidates[0]
+                const events: string[] = []
+                let currentTextIndex = textBlockIndex
+                let currentToolIndex = toolUseBlockIndex
+
+                if (candidate.content) {
+                    for (const part of candidate.content.parts) {
+                        if ('text' in part && part.text) {
+                            events.push(...utils.processTextPart(part.text, currentTextIndex))
+                            currentTextIndex++
+
+                            // 累积输出tokens
+                            accumulatedOutputTokens += this.tokenEstimator.estimate(part.text)
+                        } else if ('functionCall' in part) {
+                            events.push(...utils.processToolUsePart(part.functionCall, currentToolIndex))
+                            currentToolIndex++
+
+                            // 累积工具调用的tokens
+                            accumulatedOutputTokens += this.tokenEstimator.estimate(part.functionCall.name)
+                            accumulatedOutputTokens += this.tokenEstimator.estimate(
+                                JSON.stringify(part.functionCall.args)
+                            )
+                        }
                     }
                 }
-            }
 
-            return {
-                events,
-                textBlockIndex: currentTextIndex,
-                toolUseBlockIndex: currentToolIndex
-            }
-        })
+                return {
+                    events,
+                    textBlockIndex: currentTextIndex,
+                    toolUseBlockIndex: currentToolIndex,
+                    outputTokens: accumulatedOutputTokens
+                }
+            },
+            originalClaudeRequest, // 传递原始请求
+            this.tokenEstimator // 传递token估算器
+        )
     }
 }

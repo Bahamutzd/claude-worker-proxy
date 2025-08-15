@@ -1,3 +1,7 @@
+// 重新导出token估算器
+export { OptimizedTokenEstimator, getGlobalTokenEstimator, estimateTokens, safeJsonParse } from './token-estimator'
+import { OptimizedTokenEstimator } from './token-estimator'
+
 export function generateId(): string {
     return Math.random().toString(36).substring(2)
 }
@@ -15,10 +19,15 @@ export function sendMessageStart(controller: ReadableStreamDefaultController): v
     controller.enqueue(new TextEncoder().encode(event))
 }
 
-export function sendMessageStop(controller: ReadableStreamDefaultController): void {
-    const event = `event: message_stop\ndata: ${JSON.stringify({
-        type: 'message_stop'
-    })}\n\n`
+export function sendMessageStop(
+    controller: ReadableStreamDefaultController,
+    usage?: { input_tokens: number; output_tokens: number }
+): void {
+    const eventData: any = { type: 'message_stop' }
+    if (usage) {
+        eventData.usage = usage
+    }
+    const event = `event: message_stop\ndata: ${JSON.stringify(eventData)}\n\n`
     controller.enqueue(new TextEncoder().encode(event))
 }
 
@@ -109,7 +118,9 @@ export async function processProviderStream(
         jsonStr: string,
         textIndex: number,
         toolIndex: number
-    ) => { events: string[]; textBlockIndex: number; toolUseBlockIndex: number } | null
+    ) => { events: string[]; textBlockIndex: number; toolUseBlockIndex: number; outputTokens?: number } | null,
+    originalClaudeRequest?: any, // Claude请求用于计算input tokens
+    tokenEstimator?: OptimizedTokenEstimator // token估算器
 ): Promise<Response> {
     const stream = new ReadableStream({
         async start(controller) {
@@ -123,6 +134,7 @@ export async function processProviderStream(
             let buffer = ''
             let textBlockIndex = 0
             let toolUseBlockIndex = 0
+            let totalOutputTokens = 0
 
             sendMessageStart(controller)
 
@@ -147,6 +159,11 @@ export async function processProviderStream(
                             textBlockIndex = result.textBlockIndex
                             toolUseBlockIndex = result.toolUseBlockIndex
 
+                            // 累积输出tokens
+                            if (result.outputTokens) {
+                                totalOutputTokens = result.outputTokens
+                            }
+
                             for (const event of result.events) {
                                 controller.enqueue(new TextEncoder().encode(event))
                             }
@@ -157,13 +174,28 @@ export async function processProviderStream(
                 if (buffer.trim()) {
                     const result = processLine(buffer.slice(6), textBlockIndex, toolUseBlockIndex)
                     if (result) {
+                        if (result.outputTokens) {
+                            totalOutputTokens = result.outputTokens
+                        }
+
                         for (const event of result.events) {
                             controller.enqueue(new TextEncoder().encode(event))
                         }
                     }
                 }
                 reader.releaseLock()
-                sendMessageStop(controller)
+
+                // 计算和发送usage信息
+                let usage: { input_tokens: number; output_tokens: number } | undefined
+                if (originalClaudeRequest && tokenEstimator) {
+                    const inputTokens = tokenEstimator.estimateMessages(originalClaudeRequest.messages)
+                    usage = {
+                        input_tokens: inputTokens,
+                        output_tokens: totalOutputTokens
+                    }
+                }
+
+                sendMessageStop(controller, usage)
                 controller.close()
             }
         }
@@ -177,24 +209,6 @@ export async function processProviderStream(
             Connection: 'keep-alive'
         }
     })
-}
-
-export function safeJsonParse(jsonStr: string): any {
-    if (!jsonStr || typeof jsonStr !== 'string') {
-        return {}
-    }
-
-    try {
-        return JSON.parse(jsonStr)
-    } catch (error) {
-        try {
-            const fixedJsonStr = jsonStr.replace(/'/g, '"')
-            return JSON.parse(fixedJsonStr)
-        } catch (secondError) {
-            console.warn('Failed to parse JSON arguments:', jsonStr, secondError)
-            return {}
-        }
-    }
 }
 
 export function cleanJsonSchema(schema: any): any {

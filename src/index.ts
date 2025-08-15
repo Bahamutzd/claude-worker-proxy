@@ -1,6 +1,7 @@
 import * as provider from './provider'
 import * as gemini from './gemini'
 import * as openai from './openai'
+import * as types from './types'
 
 export default {
     async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -40,19 +41,22 @@ async function handle(request: Request): Promise<Response> {
         return new Response('Missing x-api-key header', { status: 401 })
     }
 
-    let provider: provider.Provider
+    let providerImpl: provider.Provider
     switch (typeParam) {
         case 'gemini':
-            provider = new gemini.impl()
+            providerImpl = new gemini.impl()
             break
         case 'openai':
-            provider = new openai.impl()
+            providerImpl = new openai.impl()
             break
         default:
             return new Response('Unsupported type', { status: 400 })
     }
 
-    const providerRequest = await provider.convertToProviderRequest(request.clone(), baseUrl, apiKey)
+    // 保存原始Claude请求用于token计算
+    const originalClaudeRequest = (await request.clone().json()) as types.ClaudeRequest
+
+    const providerRequest = await providerImpl.convertToProviderRequest(request.clone(), baseUrl, apiKey)
     const providerResponse = await fetch(providerRequest)
-    return await provider.convertToClaudeResponse(providerResponse)
+    return await providerImpl.convertToClaudeResponse(providerResponse, originalClaudeRequest)
 }

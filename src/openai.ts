@@ -3,6 +3,8 @@ import * as provider from './provider'
 import * as utils from './utils'
 
 export class impl implements provider.Provider {
+    private tokenEstimator = new utils.OptimizedTokenEstimator()
+
     async convertToProviderRequest(request: Request, baseUrl: string, apiKey: string): Promise<Request> {
         const claudeRequest = (await request.json()) as types.ClaudeRequest
         const openaiRequest = this.convertToOpenAIRequestBody(claudeRequest)
@@ -20,7 +22,10 @@ export class impl implements provider.Provider {
         })
     }
 
-    async convertToClaudeResponse(openaiResponse: Response): Promise<Response> {
+    async convertToClaudeResponse(
+        openaiResponse: Response,
+        originalClaudeRequest?: types.ClaudeRequest
+    ): Promise<Response> {
         if (!openaiResponse.ok) {
             return openaiResponse
         }
@@ -29,9 +34,9 @@ export class impl implements provider.Provider {
         const isStream = contentType.includes('text/event-stream')
 
         if (isStream) {
-            return this.convertStreamResponse(openaiResponse)
+            return this.convertStreamResponse(openaiResponse, originalClaudeRequest)
         } else {
-            return this.convertNormalResponse(openaiResponse)
+            return this.convertNormalResponse(openaiResponse, originalClaudeRequest)
         }
     }
 
@@ -135,7 +140,10 @@ export class impl implements provider.Provider {
         return openaiMessages
     }
 
-    private async convertNormalResponse(openaiResponse: Response): Promise<Response> {
+    private async convertNormalResponse(
+        openaiResponse: Response,
+        originalClaudeRequest?: types.ClaudeRequest
+    ): Promise<Response> {
         const openaiData = (await openaiResponse.json()) as types.OpenAIResponse
 
         const claudeResponse: types.ClaudeResponse = {
@@ -173,11 +181,22 @@ export class impl implements provider.Provider {
             }
         }
 
-        if (openaiData.usage) {
-            claudeResponse.usage = {
-                input_tokens: openaiData.usage.prompt_tokens,
-                output_tokens: openaiData.usage.completion_tokens
-            }
+        // 使用API返回的真实usage，或fallback到估算值
+        let inputTokens = openaiData.usage?.prompt_tokens || 0
+        let outputTokens = openaiData.usage?.completion_tokens || 0
+
+        // 如果API未返回usage且我们有原始请求，使用估算
+        if (!openaiData.usage && originalClaudeRequest) {
+            inputTokens = this.tokenEstimator.estimateMessages(originalClaudeRequest.messages)
+            outputTokens = this.tokenEstimator.estimateClaudeContent(claudeResponse.content)
+        } else if (!openaiData.usage?.completion_tokens && claudeResponse.content.length > 0) {
+            // 如果只缺输出tokens，估算输出部分
+            outputTokens = this.tokenEstimator.estimateClaudeContent(claudeResponse.content)
+        }
+
+        claudeResponse.usage = {
+            input_tokens: inputTokens,
+            output_tokens: outputTokens
         }
 
         return new Response(JSON.stringify(claudeResponse), {
@@ -188,46 +207,66 @@ export class impl implements provider.Provider {
         })
     }
 
-    private async convertStreamResponse(openaiResponse: Response): Promise<Response> {
-        return utils.processProviderStream(openaiResponse, (jsonStr, textBlockIndex, toolUseBlockIndex) => {
-            const openaiData = JSON.parse(jsonStr) as types.OpenAIStreamResponse
-            if (!openaiData.choices || openaiData.choices.length === 0) {
-                return null
-            }
+    private async convertStreamResponse(
+        openaiResponse: Response,
+        originalClaudeRequest?: types.ClaudeRequest
+    ): Promise<Response> {
+        let accumulatedOutputTokens = 0
 
-            const choice = openaiData.choices[0]
-            const delta = choice.delta
-            const events: string[] = []
-            let currentTextIndex = textBlockIndex
-            let currentToolIndex = toolUseBlockIndex
+        return utils.processProviderStream(
+            openaiResponse,
+            (jsonStr, textBlockIndex, toolUseBlockIndex) => {
+                const openaiData = JSON.parse(jsonStr) as types.OpenAIStreamResponse
+                if (!openaiData.choices || openaiData.choices.length === 0) {
+                    return null
+                }
 
-            if (delta.content) {
-                events.push(...utils.processTextPart(delta.content, currentTextIndex))
-                currentTextIndex++
-            }
+                const choice = openaiData.choices[0]
+                const delta = choice.delta
+                const events: string[] = []
+                let currentTextIndex = textBlockIndex
+                let currentToolIndex = toolUseBlockIndex
 
-            if (delta.tool_calls) {
-                for (const toolCall of delta.tool_calls) {
-                    if (toolCall.function?.name && toolCall.function?.arguments) {
-                        events.push(
-                            ...utils.processToolUsePart(
-                                {
-                                    name: toolCall.function.name,
-                                    args: utils.safeJsonParse(toolCall.function.arguments)
-                                },
-                                currentToolIndex
+                if (delta.content) {
+                    events.push(...utils.processTextPart(delta.content, currentTextIndex))
+                    currentTextIndex++
+
+                    // 累积输出tokens
+                    accumulatedOutputTokens += this.tokenEstimator.estimate(delta.content)
+                }
+
+                if (delta.tool_calls) {
+                    for (const toolCall of delta.tool_calls) {
+                        if (toolCall.function?.name && toolCall.function?.arguments) {
+                            const toolArgs = utils.safeJsonParse(toolCall.function.arguments)
+
+                            events.push(
+                                ...utils.processToolUsePart(
+                                    {
+                                        name: toolCall.function.name,
+                                        args: toolArgs
+                                    },
+                                    currentToolIndex
+                                )
                             )
-                        )
-                        currentToolIndex++
+                            currentToolIndex++
+
+                            // 累积工具调用的tokens
+                            accumulatedOutputTokens += this.tokenEstimator.estimate(toolCall.function.name)
+                            accumulatedOutputTokens += this.tokenEstimator.estimate(JSON.stringify(toolArgs))
+                        }
                     }
                 }
-            }
 
-            return {
-                events,
-                textBlockIndex: currentTextIndex,
-                toolUseBlockIndex: currentToolIndex
-            }
-        })
+                return {
+                    events,
+                    textBlockIndex: currentTextIndex,
+                    toolUseBlockIndex: currentToolIndex,
+                    outputTokens: accumulatedOutputTokens // 返回累积的输出tokens
+                }
+            },
+            originalClaudeRequest, // 传递原始请求用于计算input tokens
+            this.tokenEstimator // 传递token估算器
+        )
     }
 }
